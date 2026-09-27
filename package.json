@@ -1,0 +1,12 @@
+{
+  "name": "spreadsheet-audit-console-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "电子表格审查台页面切换回归测试（jsdom）",
+  "scripts": {
+    "test": "node tests/ui/page-switch.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

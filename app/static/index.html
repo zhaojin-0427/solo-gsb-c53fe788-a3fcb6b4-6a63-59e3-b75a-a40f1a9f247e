@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>电子表格公式依赖与增量重算审查台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>公式依赖与增量重算审查台</h1>
+    <p id="workbook-title">正在载入工作簿…</p>
+  </div>
+  <div class="status" id="status">就绪</div>
+</header>
+
+<main class="layout">
+  <section class="panel grid-panel">
+    <div class="toolbar">
+      <label>分支
+        <select id="branch-select"></select>
+      </label>
+      <label>查看版本
+        <select id="version-select"></select>
+      </label>
+      <button id="reload-btn" type="button">刷新</button>
+    </div>
+    <div class="sheet-tabs" id="sheet-tabs"></div>
+    <div class="formula-bar">
+      <span id="active-address">A1</span>
+      <input id="formula-input" placeholder="选择单元格后输入常量或 =A1 公式" />
+    </div>
+    <div class="table-wrap">
+      <table id="sheet-table"></table>
+    </div>
+    <div class="edit-actions">
+      <input id="message-input" placeholder="版本说明，例如：提高铅笔数量" />
+      <button id="validate-btn" type="button" class="secondary">增量预演</button>
+      <button id="commit-btn" type="button">原子提交版本</button>
+      <span id="expected-version"></span>
+    </div>
+  </section>
+
+  <aside class="panel side-panel">
+    <section class="card">
+      <h2>从任意版本创建分支</h2>
+      <label>新分支名 <input id="new-branch-name" placeholder="feature-tax" /></label>
+      <button id="branch-btn" type="button" class="secondary">创建分支</button>
+    </section>
+
+    <section class="card">
+      <h2>合并前审查</h2>
+      <label>来源分支 <select id="merge-source"></select></label>
+      <button id="merge-preview-btn" type="button" class="secondary">列出冲突与变更</button>
+      <button id="merge-btn" type="button">检查后合并到当前分支</button>
+      <div id="merge-result"></div>
+    </section>
+
+    <section class="card">
+      <h2>版本化约束门禁</h2>
+      <div id="binding-info" class="muted">正在载入当前分支绑定…</div>
+      <h3>当前生效规则</h3>
+      <div id="bound-rules"></div>
+      <h3>约束集版本</h3>
+      <div class="row-actions">
+        <label>约束集 <select id="constraint-set-select"></select></label>
+        <label>版本 <select id="constraint-version-select"></select></label>
+      </div>
+      <pre id="constraint-rules-view" class="code-block">选择约束集查看该版本的不可变规则。</pre>
+      <details>
+        <summary>编辑 / 新建约束集（每次保存生成新的不可变版本）</summary>
+        <label>名称 <input id="constraint-set-name" placeholder="预算规则" /></label>
+        <label>版本说明 <input id="constraint-set-message" placeholder="收紧数量上限" /></label>
+        <textarea id="constraint-rules-editor" rows="9" spellcheck="false"
+          placeholder='[{"name":"数量非负","type":"number_range","target":"Inputs!B2:B4","min":0}]'></textarea>
+        <div class="row-actions">
+          <button id="constraint-create-btn" type="button" class="secondary">创建约束集（v1）</button>
+          <button id="constraint-save-btn" type="button" class="secondary">保存为所选集新版本</button>
+        </div>
+      </details>
+      <div class="row-actions">
+        <label class="pin-choice">
+          <input type="checkbox" id="constraint-pin-version" />
+          钉到当前查看的历史版本（不选则绑定到当前分支头）
+        </label>
+      </div>
+      <div class="row-actions">
+        <button id="constraint-bind-btn" type="button">绑定所选版本到当前分支</button>
+      </div>
+      <h3>绑定历史</h3>
+      <div id="binding-history"></div>
+    </section>
+
+    <section class="card">
+      <h2>约束门禁结果</h2>
+      <div id="constraint-results" class="muted">预演、提交或合并后，这里按稳定顺序列出失败规则的单元格、实际值、依赖路径与约束集版本。</div>
+    </section>
+
+    <section class="card">
+      <h2>依赖图</h2>
+      <label>单元格 <input id="path-cell" placeholder="Ledger!B6" /></label>
+      <div class="row-actions">
+        <button data-path="incoming" type="button" class="secondary">谁依赖它</button>
+        <button data-path="outgoing" type="button" class="secondary">它依赖谁</button>
+      </div>
+      <pre id="dependency-paths" class="code-block">选择单元格并查看依赖路径。</pre>
+      <h3>当前版本边（源 → 目标）</h3>
+      <div id="edge-list" class="edge-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>重算与差异</h2>
+      <div id="audit-panel">提交或预演后显示受影响子图、拓扑顺序和前后值差异。</div>
+    </section>
+
+    <section class="card">
+      <h2>最短可定位诊断</h2>
+      <div id="diagnostics" class="muted">暂无诊断。</div>
+    </section>
+  </aside>
+</main>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>

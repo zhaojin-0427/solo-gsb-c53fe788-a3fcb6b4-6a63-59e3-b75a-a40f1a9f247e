@@ -88,14 +88,30 @@ CREATE TABLE IF NOT EXISTS constraint_binding (
     binding_number INTEGER NOT NULL,
     constraint_set_id INTEGER NOT NULL REFERENCES constraint_set(id),
     workbook_version_number INTEGER NOT NULL,
-    -- 绑定记录钉住的工作簿版本；旧库通过迁移按 workbook_version_number 回填。
+    -- 分支绑定时钉住的分支头版本（旧库通过迁移按 workbook_version_number 回填）。
     workbook_version_id INTEGER REFERENCES version(id),
     created_at TEXT NOT NULL,
     UNIQUE (branch_name, binding_number)
 );
--- 工作簿版本与当时生效的约束集版本的直接关联（版本级绑定）：
+-- 版本级钉版状态：与分支绑定（constraint_binding）完全分开。
+-- 钉版只改变目标历史版本的规则关联，绝不追加分支绑定、不改变分支当前
+-- 规则与绑定代数，因此预演/提交/合并门禁不受钉版影响。
+-- pin_number 是“目标版本”的独立修订号（从 1 开始，未钉版等价于 0），
+-- expected_version_number 校验该独立修订号；同一版本的并发/重复钉版
+-- 只能成功一次，其余 409 且不写记录、不移动分支头。
+CREATE TABLE IF NOT EXISTS version_pin (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workbook_version_id INTEGER NOT NULL REFERENCES version(id) ON DELETE CASCADE,
+    branch_name TEXT NOT NULL REFERENCES branch(name),
+    pin_number INTEGER NOT NULL,
+    constraint_set_id INTEGER NOT NULL REFERENCES constraint_set(id),
+    workbook_version_number INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (workbook_version_id, pin_number)
+);
+-- 工作簿版本与当时生效的约束集版本的直接关联（版本级状态）：
 -- commit = 该版本提交时按分支生效绑定评估并随提交记录；
--- pinned = 用户显式把约束集钉在该历史版本（重复钉住以最新绑定为准）。
+-- pinned = 用户显式把约束集钉在该历史版本（重复钉版以最新修订为准）。
 CREATE TABLE IF NOT EXISTS version_constraint_set (
     workbook_version_id INTEGER PRIMARY KEY REFERENCES version(id) ON DELETE CASCADE,
     constraint_set_id INTEGER NOT NULL REFERENCES constraint_set(id),
@@ -107,6 +123,7 @@ CREATE INDEX IF NOT EXISTS idx_edge_version ON edge(version_id);
 CREATE INDEX IF NOT EXISTS idx_version_branch ON version(branch_name, version_number);
 CREATE INDEX IF NOT EXISTS idx_constraint_set_name ON constraint_set(name, version_number);
 CREATE INDEX IF NOT EXISTS idx_binding_branch ON constraint_binding(branch_name, binding_number);
+CREATE INDEX IF NOT EXISTS idx_version_pin_branch ON version_pin(branch_name, id);
 CREATE INDEX IF NOT EXISTS idx_version_constraint_set ON version_constraint_set(constraint_set_id);
 """
 
@@ -183,15 +200,22 @@ class Database:
         return FIXED_TIME
 
     def _migrate_legacy_schema(self) -> None:
-        """把旧版数据库升级到版本级约束绑定模型。
+        """把旧版数据库升级到“分支绑定 / 版本钉版”两类状态分离的模型。
 
-        - 旧库的 ``constraint_binding`` 没有 ``workbook_version_id``：按记录
+        - 旧库的 ``constraint_binding`` 没有 ``workbook_version_id``：先按记录
           中的工作簿版本号回填该列；
-        - 新建关联表 ``version_constraint_set`` 后，把每条历史绑定钉住过的
-          分支头版本恢复为 ``pinned`` 关联，使历史版本详情在升级后即可恢复
-          当时规则；未被绑定精确钉住的版本由查询时的分支回放逻辑兜底。
+        - 历史钉版串改门禁修复前，版本级钉版也会在 ``constraint_binding``
+          里追加一行（绑定代数随之前进），使分支门禁被宽松规则替换。迁移时
+          把这些记录拆出到独立的 ``version_pin`` 表：判定标准是该记录钉住的
+          版本低于本分支历史上绑定过的最大工作簿版本号——真正的分支换绑
+          只会钉住当时的分支头（单调不减），钉历史版本才会回指旧版本。
+          拆出后分支绑定代数出现的空号保留不重排（绑定不可变，代数即身份），
+          “当前生效绑定取代数最大者”的门禁语义因此恢复；
+        - 新建关联表 ``version_constraint_set`` 后恢复历史版本↔规则关联：
+          分支绑定钉住的头版本与钉版钉住的精确版本都写为 ``pinned``；未被
+          精确钉住的版本由查询时沿分支回放绑定兜底。
 
-        迁移幂等：列与关联行已存在时不会重复写入或重复加列。
+        迁移幂等：列、表与关联行已存在时不会重复写入、重复加列或重复搬迁。
         """
         binding_cols = {
             row["name"] for row in self.conn.execute("PRAGMA table_info(constraint_binding)")
@@ -211,29 +235,95 @@ class Database:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_binding_version ON constraint_binding(workbook_version_id)"
         )
-        # 每条历史绑定都钉住过一个分支头版本：把这些精确版本写为 pinned。
-        # 同一版本被多个分支的绑定钉住时，先取创建该版本的分支的绑定，
-        # 再取较早的绑定；用逐版本窗口式选择保证结果确定，不依赖
-        # INSERT...SELECT 的遍历顺序。
-        if self.conn.execute("SELECT COUNT(*) FROM version_constraint_set").fetchone()[0] == 0:
-            rows = self.conn.execute(
-                """SELECT v.id AS version_id, b.constraint_set_id, b.created_at,
-                          b.id AS binding_id
-                     FROM version v
-                     JOIN constraint_binding b ON b.workbook_version_id = v.id
-                    ORDER BY v.id,
-                             (v.branch_name = b.branch_name) DESC,
-                             b.id"""
-            ).fetchall()
-            chosen: dict[int, sqlite3.Row] = {}
-            for row in rows:
-                chosen.setdefault(row["version_id"], row)
-            self.conn.executemany(
-                """INSERT OR IGNORE INTO version_constraint_set
-                       (workbook_version_id, constraint_set_id, source, created_at)
-                   VALUES (?, ?, 'pinned', ?)""",
-                [(r["version_id"], r["constraint_set_id"], r["created_at"]) for r in chosen.values()],
+        self._split_legacy_pins()
+        self._migrate_version_set_links()
+
+    def _split_legacy_pins(self) -> None:
+        """把历史钉版误写入 constraint_binding 的记录搬到 version_pin。
+
+        幂等：version_pin 已有数据（含目标版本已有修订）时跳过搬迁。
+        搬迁按 (版本, 原绑定 id) 稳定排序后在每个目标版本内从 1 重新编号，
+        使钉版修订号只与目标版本相关，不依赖分支绑定代数。
+
+        判定：真正的分支换绑只会钉住“当时的分支头”，沿绑定代数钉住的
+        工作簿版本号单调不减；版本级钉版则把规则钉到任意历史版本，必然
+        回指比此前绑定更旧的版本。因此对每条分支记录按绑定代数计算前缀
+        最大值，凡钉住版本号小于该前缀最大值的，都是串入分支链的钉版。
+        （分支可从历史版本建出，其绑定序列从头开始，前缀判定同样成立。）
+        """
+        if self.conn.execute("SELECT COUNT(*) FROM version_pin").fetchone()[0] > 0:
+            return
+        rows = self.conn.execute(
+            """SELECT * FROM constraint_binding
+               ORDER BY branch_name, binding_number, id"""
+        ).fetchall()
+        prefix_max: dict[str, int] = {}
+        pin_rows_by_version: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            branch = row["branch_name"]
+            current_max = prefix_max.get(branch)
+            if current_max is not None and row["workbook_version_number"] < current_max:
+                pin_rows_by_version.setdefault(row["workbook_version_id"], []).append(row)
+            prefix_max[branch] = max(
+                row["workbook_version_number"],
+                current_max if current_max is not None else row["workbook_version_number"],
             )
+        pin_rows = []
+        for version_id in sorted(pin_rows_by_version):
+            for pin_number, row in enumerate(pin_rows_by_version[version_id], start=1):
+                pin_rows.append((
+                    row["id"], row["workbook_version_id"], row["branch_name"], pin_number,
+                    row["constraint_set_id"], row["workbook_version_number"], row["created_at"],
+                ))
+        if not pin_rows:
+            return
+        with self.conn:
+            self.conn.executemany(
+                """INSERT INTO version_pin
+                       (id,workbook_version_id,branch_name,pin_number,constraint_set_id,
+                        workbook_version_number,created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                pin_rows,
+            )
+            self.conn.executemany(
+                "DELETE FROM constraint_binding WHERE id=?",
+                [(row[0],) for row in pin_rows],
+            )
+
+    def _migrate_version_set_links(self) -> None:
+        """从分支绑定与钉版历史恢复版本↔约束集的 pinned 关联。
+
+        同一版本被多条记录钉住时，先取创建该版本的分支的记录，再取较早的
+        记录；逐版本窗口式选择保证结果确定，不依赖 INSERT...SELECT 的遍历
+        顺序。幂等：version_constraint_set 已有数据时不重写。
+        """
+        if self.conn.execute("SELECT COUNT(*) FROM version_constraint_set").fetchone()[0] > 0:
+            return
+        rows = self.conn.execute(
+            """SELECT v.id AS version_id, picked.constraint_set_id, picked.created_at
+                 FROM version v
+                 JOIN (
+                        SELECT b.workbook_version_id AS version_id,
+                               b.constraint_set_id, b.created_at, b.branch_name, b.id
+                          FROM constraint_binding b
+                         WHERE b.workbook_version_id IS NOT NULL
+                         UNION ALL
+                        SELECT p.workbook_version_id AS version_id,
+                               p.constraint_set_id, p.created_at, p.branch_name, p.id
+                          FROM version_pin p
+                      ) picked
+                   ON picked.version_id = v.id
+                ORDER BY v.id, (v.branch_name = picked.branch_name) DESC, picked.id"""
+        ).fetchall()
+        chosen: dict[int, sqlite3.Row] = {}
+        for row in rows:
+            chosen.setdefault(row["version_id"], row)
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO version_constraint_set
+                   (workbook_version_id, constraint_set_id, source, created_at)
+               VALUES (?, ?, 'pinned', ?)""",
+            [(r["version_id"], r["constraint_set_id"], r["created_at"]) for r in chosen.values()],
+        )
 
     def workbook(self) -> dict:
         row = self.conn.execute(
@@ -340,6 +430,9 @@ class Database:
             # commit：该版本提交时按当时分支生效绑定记录/回放。
             "source": row["source"],
             "pinned_at": row["pinned_at"],
+            # 该目标版本的独立钉版修订号（未钉版为 0）；钉版请求的
+            # expected_version_number 必须等于此值，成功后前进 1。
+            "pin_revision": self.pin_revision(version["id"]),
         }
 
     def cells(self, version_id: int) -> list[dict]:
@@ -1028,6 +1121,7 @@ class Database:
     def _binding_row(row, with_rules: bool = True) -> dict:
         data = {
             "id": row["id"],
+            "kind": "branch",
             "branch_name": row["branch_name"],
             "binding_number": row["binding_number"],
             "constraint_set": row["set_name"],
@@ -1046,6 +1140,30 @@ class Database:
         FROM constraint_binding b JOIN constraint_set s ON s.id = b.constraint_set_id
     """
 
+    @staticmethod
+    def _pin_row(row, with_rules: bool = True) -> dict:
+        data = {
+            "id": row["id"],
+            "kind": "version_pin",
+            "branch_name": row["branch_name"],
+            # 目标版本的独立钉版修订号（同一版本内从 1 递增）。
+            "pin_number": row["pin_number"],
+            "constraint_set": row["set_name"],
+            "constraint_set_id": row["constraint_set_id"],
+            "constraint_set_version": row["set_version"],
+            "workbook_version_number": row["workbook_version_number"],
+            "workbook_version_id": row["workbook_version_id"],
+            "created_at": row["created_at"],
+        }
+        if with_rules:
+            data["rules"] = json.loads(row["rules_json"])
+        return data
+
+    _PIN_SELECT = """
+        SELECT p.*, s.name AS set_name, s.version_number AS set_version, s.rules_json
+        FROM version_pin p JOIN constraint_set s ON s.id = p.constraint_set_id
+    """
+
     def active_binding(self, branch_name: str) -> dict | None:
         row = self.conn.execute(
             self._BINDING_SELECT + "WHERE b.branch_name=? ORDER BY b.binding_number DESC LIMIT 1",
@@ -1054,7 +1172,11 @@ class Database:
         return self._binding_row(row) if row else None
 
     def active_bindings(self) -> list[dict]:
-        """每个分支当前生效的绑定（绑定代数最大的一条）。"""
+        """每个分支当前生效的分支绑定（绑定代数最大的一条）。
+
+        只包含 constraint_binding（分支绑定状态）；版本钉版状态
+        （version_pin）不参与分支当前规则，故不出现在这里。
+        """
         rows = self.conn.execute(
             self._BINDING_SELECT + """
             JOIN (SELECT branch_name, MAX(binding_number) AS latest
@@ -1072,6 +1194,32 @@ class Database:
         ).fetchall()
         return [self._binding_row(row, with_rules=False) for row in rows]
 
+    def pin_revision(self, version_id: int) -> int:
+        """目标版本当前的独立钉版修订号（未钉版为 0）。"""
+        return self.conn.execute(
+            "SELECT COALESCE(MAX(pin_number),0) FROM version_pin WHERE workbook_version_id=?",
+            (version_id,),
+        ).fetchone()[0]
+
+    def active_pin(self, version_id: int) -> dict | None:
+        """指定历史版本当前生效的钉版（修订号最大的一条）。"""
+        row = self.conn.execute(
+            self._PIN_SELECT
+            + "WHERE p.workbook_version_id=? ORDER BY p.pin_number DESC LIMIT 1",
+            (version_id,),
+        ).fetchone()
+        return self._pin_row(row) if row else None
+
+    def pin_history(self, branch_name: str) -> list[dict]:
+        """分支归属的全部历史版本钉版记录，按版本号与修订号排列。"""
+        self.branch(branch_name)
+        rows = self.conn.execute(
+            self._PIN_SELECT
+            + "WHERE p.branch_name=? ORDER BY p.workbook_version_number, p.pin_number, p.id",
+            (branch_name,),
+        ).fetchall()
+        return [self._pin_row(row, with_rules=False) for row in rows]
+
     def create_binding(
         self,
         branch_name: str | None,
@@ -1081,25 +1229,97 @@ class Database:
         timestamp: str | None = None,
         version_id: int | None = None,
     ) -> dict:
-        """把约束集的某个不可变版本绑定到分支，或钉到指定历史工作簿版本。
+        """分支换绑：把约束集的某个不可变版本绑定到分支当前头版本。
 
-        - 不传 ``version_id``：绑定到 ``branch_name`` 当前头版本（历史
-          行为不变，位置参数与旧调用兼容）；
-        - 传 ``version_id``：把不可变规则钉在该历史版本。绑定记录归属该
-          版本所在分支（``version.branch_name``）；若同时给了非空
-          ``branch_name``，二者必须一致，否则抛出 ``ValueError``。
-        - ``expected_version_number`` 始终是归属分支当前的绑定代数
-          （尚未绑定时为 0），校验与写入在同一个 ``BEGIN IMMEDIATE``
-          事务中原子完成；重复请求会因绑定代数已前进而失败，不写记录、
-          不移动分支头。
+        钉版（``version_id``）是另一类状态，已拆到 :meth:`create_pin`；
+        这里收到 ``version_id`` 时直接转调，保持旧位置参数调用兼容。
 
-        版本级钉住同时 upsert 到 ``version_constraint_set``：同一版本重复
-        钉住时以最新绑定为准；普通提交产生的版本则保留提交时记录。
+        ``expected_version_number`` 是该分支当前的绑定代数（尚未绑定时为
+        0），校验与写入在同一个 ``BEGIN IMMEDIATE`` 事务中原子完成；并发
+        或重复请求只有一个能消费当前代数，其余抛 ``VersionConflict``，
+        不写记录、不移动分支头。
         """
+        if version_id is not None:
+            return self.create_pin(
+                version_id, set_name, set_version, expected_version_number,
+                timestamp=timestamp, branch_name=branch_name,
+            )
+        if not branch_name:
+            raise ValueError("必须提供 branch 或 version_id")
         if not isinstance(expected_version_number, int) or isinstance(expected_version_number, bool):
             raise ValueError("expected_version_number 必须是整数")
-        if version_id is not None and (not isinstance(version_id, int) or isinstance(version_id, bool)):
+        set_row = self.conn.execute(
+            "SELECT * FROM constraint_set WHERE name=? AND version_number=?",
+            (set_name, set_version),
+        ).fetchone()
+        if not set_row:
+            raise KeyError(f"约束集版本不存在: {set_name}@v{set_version}")
+        self.branch(branch_name)  # 不存在时 KeyError
+        with self._write_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = self.conn.execute(
+                    "SELECT COALESCE(MAX(binding_number),0) FROM constraint_binding WHERE branch_name=?",
+                    (branch_name,),
+                ).fetchone()[0]
+                if current != expected_version_number:
+                    raise VersionConflict(expected_version_number, current)
+                head = self.branch(branch_name)["head_version_id"]
+                if head is None:
+                    raise ValueError("分支没有可绑定版本")
+                head_number = self.conn.execute(
+                    "SELECT version_number FROM version WHERE id=?", (head,)
+                ).fetchone()[0]
+                created_at = timestamp or utc_now()
+                self.conn.execute(
+                    """INSERT INTO constraint_binding(branch_name,binding_number,constraint_set_id,
+                       workbook_version_number,workbook_version_id,created_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (branch_name, current + 1, set_row["id"], head_number, head, created_at),
+                )
+                # 分支换绑只影响后续预演/提交/合并门禁：在头版本尚无关联时
+                # 补一条 pinned（与旧库迁移回放语义一致）；已提交并记录过
+                # 规则的头版本保持其 commit 关联，不被覆盖。绝不改写其他
+                # 历史版本，也不影响 version_pin。
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO version_constraint_set
+                           (workbook_version_id,constraint_set_id,source,created_at)
+                       VALUES (?,?, 'pinned', ?)""",
+                    (head, set_row["id"], created_at),
+                )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return self.active_binding(branch_name)
+
+    def create_pin(
+        self,
+        version_id: int,
+        set_name: str,
+        set_version: int,
+        expected_version_number,
+        timestamp: str | None = None,
+        branch_name: str | None = None,
+    ) -> dict:
+        """钉版：把不可变规则钉到指定历史工作簿版本。
+
+        钉版只改变目标版本的规则关联（``version_constraint_set``），并在
+        ``version_pin`` 留下该版本的一条修订记录；它**不**追加分支绑定、
+        **不**改变分支当前规则与绑定代数，分支头也不移动，因此随后的
+        预演、提交、合并门禁完全保持不变。
+
+        - 记录归属该版本所在分支（``version.branch_name``）；若同时给了
+          ``branch_name``，二者必须一致，否则抛 ``ValueError``；
+        - ``expected_version_number`` 校验的是**目标版本的独立钉版修订号**
+          （该版本未钉版时为 0），与分支绑定代数互不相关；同一版本的并发
+          或重复钉版只有一个成功，其余抛 ``VersionConflict``，不写记录、
+          不移动分支头；同一版本再次钉版（不同修订号）以新规则为准。
+        """
+        if not isinstance(version_id, int) or isinstance(version_id, bool):
             raise ValueError("version_id 必须是整数")
+        if not isinstance(expected_version_number, int) or isinstance(expected_version_number, bool):
+            raise ValueError("expected_version_number 必须是整数")
         set_row = self.conn.execute(
             "SELECT * FROM constraint_set WHERE name=? AND version_number=?",
             (set_name, set_version),
@@ -1107,85 +1327,47 @@ class Database:
         if not set_row:
             raise KeyError(f"约束集版本不存在: {set_name}@v{set_version}")
         # 先解析目标并校验版本归属（失败时不开事务）。
-        target = self._resolve_binding_target(branch_name, version_id)
-        target_branch, target_version = target["branch"], target["version"]
+        target_version = self.version(version_id)
+        owner = target_version["branch_name"]
+        if branch_name is not None and branch_name != owner:
+            raise ValueError(
+                f"版本 v{target_version['version_number']} 属于分支 {owner}，不能绑定到分支 {branch_name}"
+            )
         with self._write_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
-                current = self.conn.execute(
-                    "SELECT COALESCE(MAX(binding_number),0) FROM constraint_binding WHERE branch_name=?",
-                    (target_branch,),
-                ).fetchone()[0]
+                # 事务内重读版本，确认归属未被任何 DDL/数据操作改变。
+                fresh = self.version(version_id)
+                if fresh["branch_name"] != owner:
+                    raise ValueError("版本不属于该分支")
+                current = self.pin_revision(version_id)
                 if current != expected_version_number:
                     raise VersionConflict(expected_version_number, current)
-                # 版本级钉住要求目标版本归属归属分支（分支可包含在别处分叉
-                # 而来的头版本，普通分支绑定不做此限制）；事务内再次确认。
-                fresh_version = self.version(target_version["id"])
-                if version_id is not None and fresh_version["branch_name"] != target_branch:
-                    raise ValueError("版本不属于该分支")
-                head = self.branch(target_branch)["head_version_id"]
-                head_number = self.conn.execute(
-                    "SELECT version_number FROM version WHERE id=?", (head,)
-                ).fetchone()[0]
-                pinned = version_id is not None
-                wb_version_id = target_version["id"] if pinned else head
-                wb_version_number = target_version["version_number"] if pinned else head_number
+                created_at = timestamp or utc_now()
                 self.conn.execute(
-                    """INSERT INTO constraint_binding(branch_name,binding_number,constraint_set_id,
-                       workbook_version_number,workbook_version_id,created_at)
+                    """INSERT INTO version_pin(workbook_version_id,branch_name,pin_number,
+                       constraint_set_id,workbook_version_number,created_at)
                        VALUES (?,?,?,?,?,?)""",
-                    (target_branch, current + 1, set_row["id"],
-                     wb_version_number, wb_version_id, timestamp or utc_now()),
+                    (version_id, owner, current + 1, set_row["id"],
+                     target_version["version_number"], created_at),
                 )
-                if pinned:
-                    # 显式钉在历史版本：以最新绑定覆盖该版本原有
-                    # commit/pinned 关联，保证历史详情恢复用户钉住的规则。
-                    self.conn.execute(
-                        """INSERT INTO version_constraint_set(workbook_version_id,constraint_set_id,
-                               source,created_at)
-                           VALUES (?,?, 'pinned', ?)
-                           ON CONFLICT(workbook_version_id) DO UPDATE SET
-                               constraint_set_id=excluded.constraint_set_id,
-                               source='pinned',
-                               created_at=excluded.created_at""",
-                        (wb_version_id, set_row["id"], timestamp or utc_now()),
-                    )
-                else:
-                    # 绑定到分支头：只在该版本尚无关联时补一条 pinned
-                    # （与旧库迁移回放语义一致）；已提交并记录过规则的
-                    # 头版本保持其 commit 关联，不被覆盖。
-                    self.conn.execute(
-                        """INSERT OR IGNORE INTO version_constraint_set
-                               (workbook_version_id,constraint_set_id,source,created_at)
-                           VALUES (?,?, 'pinned', ?)""",
-                        (wb_version_id, set_row["id"], timestamp or utc_now()),
-                    )
+                # 只改写目标版本的规则关联：以最新钉版覆盖该版本原有
+                # commit/pinned 关联，保证历史详情恢复用户钉住的规则。
+                self.conn.execute(
+                    """INSERT INTO version_constraint_set(workbook_version_id,constraint_set_id,
+                           source,created_at)
+                       VALUES (?,?, 'pinned', ?)
+                       ON CONFLICT(workbook_version_id) DO UPDATE SET
+                           constraint_set_id=excluded.constraint_set_id,
+                           source='pinned',
+                           created_at=excluded.created_at""",
+                    (version_id, set_row["id"], created_at),
+                )
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
                 raise
-        return self.active_binding(target_branch)
-
-    def _resolve_binding_target(self, branch_name: str | None, version_id: int | None) -> dict:
-        """解析绑定目标并校验版本归属。"""
-        if version_id is not None:
-            target_version = self.version(version_id)
-            owner = target_version["branch_name"]
-            if branch_name is not None and branch_name != owner:
-                raise ValueError(
-                    f"版本 v{target_version['version_number']} 属于分支 {owner}，不能绑定到分支 {branch_name}"
-                )
-            target_branch = owner
-        else:
-            if not branch_name:
-                raise ValueError("必须提供 branch 或 version_id")
-            self.branch(branch_name)  # 不存在时 KeyError
-            target_branch = branch_name
-            head_id = self.branch(branch_name)["head_version_id"]
-            if head_id is None:
-                raise ValueError("分支没有可绑定版本")
-            target_version = self.version(head_id)
-        return {"branch": target_branch, "version": target_version}
+        return self.active_pin(version_id)
 
     def _evaluate_constraints(self, branch_name, values, changed, affected, deps, reverse) -> dict | None:
         """在增量重算完成后评估分支当前绑定的约束集；未绑定时返回 None。"""
@@ -1255,6 +1437,7 @@ class Database:
         if binding is None:
             return None
         return {
+            "kind": binding.get("kind", "branch"),
             "constraint_set": binding["constraint_set"],
             "constraint_set_version": binding["constraint_set_version"],
             "binding_number": binding["binding_number"],

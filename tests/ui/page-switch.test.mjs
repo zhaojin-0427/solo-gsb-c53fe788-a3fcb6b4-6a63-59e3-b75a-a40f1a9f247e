@@ -4,8 +4,10 @@
  * 2. 切换到历史版本时，"当前生效规则" 与版本信息恢复该版本当时规则，
  *    且钉住复选框只在历史版本下可用；
  * 3. 在历史版本勾选钉住并提交，请求体只带 version_id（不带 branch），
- *    expected_version_number 取版本归属分支的绑定代数；
- * 4. 历史版本下编辑被阻止（不触发 validate/commit 请求）。
+ *    expected_version_number 取目标版本自身的钉版修订号（未钉版为 0），
+ *    与分支绑定代数无关；
+ * 4. 钉版成功后分支绑定卡片与绑定代数保持不变，钉版进入独立钉版历史；
+ * 5. 历史版本下编辑被阻止（不触发 validate/commit 请求）。
  */
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
@@ -33,7 +35,7 @@ function makeMocks() {
       message: '初始', audit: {}, created_at: '2026-01-01T00:00:00Z',
       effective_constraint_set: {
         constraint_set: '示例约束集', constraint_set_id: 1, constraint_set_version: 1,
-        source: 'pinned', pinned_at: '2026-01-01T00:00:00Z',
+        source: 'pinned', pinned_at: '2026-01-01T00:00:00Z', pin_revision: 0,
         rules: [rule('旧规则', 10)],
       },
     },
@@ -42,18 +44,20 @@ function makeMocks() {
       message: '后续提交', audit: {}, created_at: '2026-01-02T00:00:00Z',
       effective_constraint_set: {
         constraint_set: '预算规则', constraint_set_id: 2, constraint_set_version: 1,
-        source: 'commit', pinned_at: '2026-01-02T00:00:00Z',
+        source: 'commit', pinned_at: '2026-01-02T00:00:00Z', pin_revision: 0,
         rules: [rule('新规则', 100)],
       },
     },
   ];
 
   const bindings = [{
-    id: 2, branch_name: 'main', binding_number: 2,
+    id: 2, kind: 'branch', branch_name: 'main', binding_number: 2,
     constraint_set: '预算规则', constraint_set_id: 2, constraint_set_version: 1,
     workbook_version_number: 2, workbook_version_id: 2,
     created_at: '2026-01-02T00:00:00Z',
   }];
+  // 钉版是与分支绑定独立的状态；初始为空。
+  const pins = [];
 
   async function handler(url, options = {}) {
     const method = options.method || 'GET';
@@ -100,34 +104,54 @@ function makeMocks() {
     if (method === 'GET' && url.startsWith('/api/constraint-bindings/history')) {
       return json([
         {
-          id: 1, branch_name: 'main', binding_number: 1,
+          id: 1, kind: 'branch', branch_name: 'main', binding_number: 1,
           constraint_set: '示例约束集', constraint_set_id: 1, constraint_set_version: 1,
           workbook_version_number: 1, workbook_version_id: 1, created_at: 'x',
         },
         ...bindings,
       ]);
     }
+    if (method === 'GET' && url.startsWith('/api/constraint-bindings/pins')) {
+      return json(pins);
+    }
     if (method === 'POST' && url === '/api/constraint-bindings') {
       const body = options.body ? JSON.parse(options.body) : {};
+      if (body.version_id != null) {
+        // 钉版：expected_version_number 是目标版本的独立钉版修订号。
+        const target = versions.find((v) => v.id === body.version_id);
+        const currentRevision = pins
+          .filter((p) => p.workbook_version_id === body.version_id).length;
+        if (body.expected_version_number !== currentRevision) {
+          return json({ detail: { code: 'VERSION_CONFLICT', message: '冲突' } }, 409);
+        }
+        const newPin = {
+          id: 100 + pins.length, kind: 'version_pin', branch_name: 'main',
+          pin_number: currentRevision + 1,
+          constraint_set: '预算规则', constraint_set_id: 2, constraint_set_version: 1,
+          workbook_version_number: target.version_number,
+          workbook_version_id: target.id,
+          created_at: '2026-01-03T00:00:00Z',
+        };
+        pins.push(newPin);
+        // 模拟后端只更新目标版本的关联为 pinned 并推进其钉版修订号；
+        // 分支绑定（bindings）与分支头完全不变。
+        target.effective_constraint_set = {
+          ...target.effective_constraint_set,
+          source: 'pinned',
+          pin_revision: currentRevision + 1,
+        };
+        return json({ pin: newPin, binding: newPin });
+      }
       if (body.expected_version_number !== bindings[bindings.length - 1].binding_number) {
         return json({ detail: { code: 'VERSION_CONFLICT', message: '冲突' } }, 409);
       }
       const newBinding = {
-        id: 3, branch_name: 'main', binding_number: 3,
+        id: 3, kind: 'branch', branch_name: 'main', binding_number: 3,
         constraint_set: '预算规则', constraint_set_id: 2, constraint_set_version: 1,
-        workbook_version_number: versions.find((v) => v.id === body.version_id)?.version_number || 2,
-        workbook_version_id: body.version_id || 2,
+        workbook_version_number: 2, workbook_version_id: 2,
         created_at: '2026-01-03T00:00:00Z',
       };
       bindings.push(newBinding);
-      // 模拟后端把版本关联更新为 pinned。
-      const pinnedVersion = versions.find((v) => v.id === (body.version_id || 2));
-      if (pinnedVersion) {
-        pinnedVersion.effective_constraint_set = {
-          ...pinnedVersion.effective_constraint_set,
-          source: 'pinned',
-        };
-      }
       return json({ binding: newBinding });
     }
     if (method === 'POST' && (url === '/api/validate' || url === '/api/commits')) {
@@ -233,20 +257,50 @@ async function main() {
   check('钉住请求带 version_id=1', bindCall.body.version_id === 1, JSON.stringify(bindCall.body));
   check('钉住请求不携带 branch', !('branch' in bindCall.body));
   check(
-    'expected_version_number 取 main 当前绑定代数 2',
-    bindCall.body.expected_version_number === 2,
+    'expected_version_number 取目标版本自身钉版修订号 0（不是分支代数 2）',
+    bindCall.body.expected_version_number === 0,
     JSON.stringify(bindCall.body),
   );
   // 绑定成功后版本详情重新拉取并显示 pinned 来源。
   await waitFor(window, () => doc.getElementById('status').textContent.includes('钉到'));
   check(
-    '钉住成功后状态提示包含版本归属与代数',
+    '钉住成功后状态提示包含版本归属与钉版修订',
     doc.getElementById('status').textContent.includes('main') &&
-      doc.getElementById('status').textContent.includes('绑定代数 3'),
+      doc.getElementById('status').textContent.includes('钉版修订 1') &&
+      doc.getElementById('status').textContent.includes('不影响分支门禁'),
     doc.getElementById('status').textContent,
   );
+  // 4) 钉版不改变分支当前绑定卡片（仍是绑定代数 2、预算规则）：切回分支头确认。
+  const versionSelect = doc.getElementById('version-select');
+  versionSelect.value = '2';
+  versionSelect.dispatchEvent(new window.Event('change', { bubbles: true }));
+  await waitFor(
+    window,
+    () => doc.getElementById('binding-info').textContent.includes('绑定代数 2'),
+  );
+  check(
+    '切回分支头后绑定卡片仍显示代数 2（钉版不追加分支绑定）',
+    doc.getElementById('binding-info').textContent.includes('预算规则') &&
+      doc.getElementById('binding-info').textContent.includes('绑定代数 2'),
+    doc.getElementById('binding-info').textContent,
+  );
+  const branchBindingCalls = mocks.calls.filter(
+    (c) => c.url === '/api/constraint-bindings' && c.method === 'POST',
+  );
+  check('仅发送了一次写请求', branchBindingCalls.length === 1);
+  // 钉版记录出现在独立的"历史版本钉版"分区，且分支换绑分区仍只有原记录。
+  check(
+    '历史面板展示钉版修订与分支换绑两类记录',
+    doc.getElementById('binding-history').textContent.includes('历史版本钉版') &&
+      doc.getElementById('binding-history').textContent.includes('钉版修订 #1') &&
+      doc.getElementById('binding-history').textContent.includes('分支换绑'),
+    doc.getElementById('binding-history').textContent,
+  );
 
-  // 4) 历史版本下编辑被阻止，不产生 validate/commit 请求。
+  // 5) 切回历史版本 v1，编辑被阻止，不产生 validate/commit 请求。
+  versionSelect.value = '1';
+  versionSelect.dispatchEvent(new window.Event('change', { bubbles: true }));
+  await waitFor(window, () => doc.getElementById('constraint-pin-version').disabled === false);
   const callsBefore = mocks.calls.length;
   const formula = doc.getElementById('formula-input');
   formula.value = '999';

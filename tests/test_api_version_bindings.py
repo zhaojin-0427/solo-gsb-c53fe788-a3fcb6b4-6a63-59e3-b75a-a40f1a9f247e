@@ -90,25 +90,89 @@ class VersionBindingApiTests(unittest.TestCase):
             "version_id": 1,
             "constraint_set": "历史钉住",
             "constraint_set_version": 1,
-            "expected_version_number": 1,
+            # 钉版校验目标版本的独立钉版修订号（v1 未钉版 = 0），
+            # 与 main 的绑定代数无关。
+            "expected_version_number": 0,
         })
         self.assertEqual(response.status_code, 200, response.text)
-        binding = response.json()["binding"]
-        self.assertEqual(binding["branch_name"], "main")
-        self.assertEqual(binding["workbook_version_id"], 1)
+        pin = response.json()["pin"]
+        self.assertEqual(pin["kind"], "version_pin")
+        self.assertEqual(pin["branch_name"], "main")
+        self.assertEqual(pin["workbook_version_id"], 1)
+        self.assertEqual(pin["pin_number"], 1)
 
         # 历史详情恢复被钉住的规则。
         detail = self.client.get("/api/versions/1").json()
-        self.assertEqual(
-            detail["version"]["effective_constraint_set"]["constraint_set"], "历史钉住"
-        )
-        self.assertEqual(
-            detail["version"]["effective_constraint_set"]["source"], "pinned"
-        )
+        effective = detail["version"]["effective_constraint_set"]
+        self.assertEqual(effective["constraint_set"], "历史钉住")
+        self.assertEqual(effective["source"], "pinned")
+        self.assertEqual(effective["pin_revision"], 1)
         # 头版本 v3 的规则不受影响。
         head = self.client.get("/api/versions/3").json()
         self.assertEqual(
             head["version"]["effective_constraint_set"]["constraint_set"], "示例约束集"
+        )
+
+    def test_pin_does_not_change_branch_binding_or_gate(self):
+        # 核心回归：钉版到历史版本后，分支当前绑定/代数与后续门禁不变。
+        self._save_set("宽松集", 10000, 0)
+        active_before = self.client.get("/api/constraint-bindings").json()
+        main_before = next(b for b in active_before if b["branch_name"] == "main")
+
+        pin = self.client.post("/api/constraint-bindings", json={
+            "version_id": 1,
+            "constraint_set": "宽松集",
+            "constraint_set_version": 1,
+            "expected_version_number": 0,
+        })
+        self.assertEqual(pin.status_code, 200, pin.text)
+
+        # /api/constraint-bindings 仍只列分支绑定，且 main 绑定未变。
+        active_after = self.client.get("/api/constraint-bindings").json()
+        main_after = next(b for b in active_after if b["branch_name"] == "main")
+        self.assertEqual(main_after["binding_number"], main_before["binding_number"])
+        self.assertEqual(main_after["constraint_set"], main_before["constraint_set"])
+        # 钉版历史独立查询。
+        pins = self.client.get(
+            "/api/constraint-bindings/pins?branch=main"
+        ).json()
+        self.assertEqual(len(pins), 1)
+        self.assertEqual(pins[0]["kind"], "version_pin")
+        self.assertEqual(pins[0]["workbook_version_id"], 1)
+        # 分支绑定历史里没有钉版记录。
+        history = self.client.get(
+            "/api/constraint-bindings/history?branch=main"
+        ).json()
+        self.assertEqual(len(history), 1)
+
+        # 钉版宽松规则后，违反种子严格规则（数量非负）的编辑仍被拦截。
+        bad = self._commit("B3", "-5", 1, "钉版后违规")
+        self.assertEqual(bad.status_code, 422, bad.text)
+        self.assertTrue(bad.json()["detail"].get("constraint_violations"))
+        head = next(
+            b for b in self.client.get("/api/branches").json() if b["name"] == "main"
+        )["head_version_id"]
+        self.assertEqual(head, 1)
+
+    def test_duplicate_pin_returns_conflict_without_write(self):
+        self._save_set("钉版重复", 100, 0)
+        payload = {
+            "version_id": 1,
+            "constraint_set": "钉版重复",
+            "constraint_set_version": 1,
+            "expected_version_number": 0,
+        }
+        first = self.client.post("/api/constraint-bindings", json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        duplicate = self.client.post("/api/constraint-bindings", json=payload)
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.json()["detail"]["code"], "VERSION_CONFLICT")
+        # 只有一条钉版，分支绑定只有种子一条。
+        self.assertEqual(
+            len(self.client.get("/api/constraint-bindings/pins?branch=main").json()), 1
+        )
+        self.assertEqual(
+            len(self.client.get("/api/constraint-bindings/history?branch=main").json()), 1
         )
 
     def test_pin_validates_version_ownership(self):
@@ -164,6 +228,56 @@ class VersionBindingApiTests(unittest.TestCase):
             "/api/constraint-bindings/history?branch=main"
         ).json()
         self.assertEqual(len(history), 2)  # 种子绑定 + 一次成功绑定
+
+    def test_commit_after_pin_uses_branch_rules(self):
+        # 钉宽松规则到历史 v1 后：违规提交仍 422；合规提交成功并按分支当前
+        # 严格（种子）规则记录，被钉的 v1 关联不变。
+        self._save_set("宽松集", 10000, 0)
+        pin = self.client.post("/api/constraint-bindings", json={
+            "version_id": 1,
+            "constraint_set": "宽松集",
+            "constraint_set_version": 1,
+            "expected_version_number": 0,
+        })
+        self.assertEqual(pin.status_code, 200, pin.text)
+
+        bad = self._commit("B3", "-5", 1, "违规")
+        self.assertEqual(bad.status_code, 422, bad.text)
+
+        ok = self._commit("B3", "3", 1, "钉版后合规提交")
+        self.assertEqual(ok.status_code, 200, ok.text)
+        new_id = ok.json()["version"]["id"]
+        new_effective = self.client.get(
+            f"/api/versions/{new_id}/constraint-set"
+        ).json()["constraint_set"]
+        self.assertEqual(new_effective["constraint_set"], "示例约束集")
+        self.assertEqual(new_effective["source"], "commit")
+        # 被钉的 v1 仍是宽松 pinned。
+        v1 = self.client.get("/api/versions/1/constraint-set").json()["constraint_set"]
+        self.assertEqual(v1["constraint_set"], "宽松集")
+        self.assertEqual(v1["source"], "pinned")
+        self.assertEqual(v1["pin_revision"], 1)
+
+    def test_repin_requires_advanced_revision(self):
+        self._save_set("钉版集", 100, 0)
+        first = self.client.post("/api/constraint-bindings", json={
+            "version_id": 1, "constraint_set": "钉版集",
+            "constraint_set_version": 1, "expected_version_number": 0,
+        })
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["pin"]["pin_number"], 1)
+        # 旧修订号 0 再次钉版 -> 409。
+        stale = self.client.post("/api/constraint-bindings", json={
+            "version_id": 1, "constraint_set": "钉版集",
+            "constraint_set_version": 1, "expected_version_number": 0,
+        })
+        self.assertEqual(stale.status_code, 409)
+        # 分支绑定代数不受钉版影响：仍是种子代数 1。
+        main = next(
+            b for b in self.client.get("/api/constraint-bindings").json()
+            if b["branch_name"] == "main"
+        )
+        self.assertEqual(main["binding_number"], 1)
 
     def test_duplicate_constraint_set_create_is_conflict(self):
         self._save_set("一次", 100, 0)

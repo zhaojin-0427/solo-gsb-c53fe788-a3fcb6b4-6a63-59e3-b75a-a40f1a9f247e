@@ -213,6 +213,7 @@ def update_constraint_set(data: dict, state: State, name: str) -> dict:
 
 @get("/api/constraint-bindings", tags=["constraints"], sync_to_thread=False)
 def constraint_bindings(state: State) -> list[dict]:
+    # 只返回分支绑定状态；版本钉版是另一类状态，见 /api/constraint-bindings/pins。
     return state.db.active_bindings()
 
 
@@ -220,6 +221,15 @@ def constraint_bindings(state: State) -> list[dict]:
 def constraint_binding_history(state: State, branch: str = "main") -> list[dict]:
     try:
         return state.db.binding_history(branch)
+    except KeyError as exc:
+        raise NotFoundException(str(exc)) from exc
+
+
+@get("/api/constraint-bindings/pins", tags=["constraints"], sync_to_thread=False)
+def constraint_pin_history(state: State, branch: str = "main") -> list[dict]:
+    """审计查询：分支归属的历史版本钉版记录（与分支绑定代数无关）。"""
+    try:
+        return state.db.pin_history(branch)
     except KeyError as exc:
         raise NotFoundException(str(exc)) from exc
 
@@ -238,15 +248,30 @@ def create_constraint_binding(data: dict, state: State) -> dict:
         raise HTTPException(detail="必须提供 branch 或 version_id", status_code=400)
     if branch is not None and not isinstance(branch, str):
         raise HTTPException(detail="branch 必须是字符串", status_code=400)
+    expected = data.get("expected_version_number")
     try:
-        return {"binding": state.db.create_binding(
+        if version_id is not None:
+            # 版本钉版：只改变目标版本的规则关联，不追加分支绑定、不改变
+            # 分支当前规则与绑定代数；expected_version_number 校验目标版本
+            # 的独立钉版修订号（未钉版为 0）。
+            pin = state.db.create_pin(
+                version_id,
+                data.get("constraint_set", ""),
+                set_version,
+                expected,
+                data.get("timestamp"),
+                branch_name=branch,
+            )
+            return {"pin": pin, "binding": pin}
+        # 分支换绑：沿用原绑定代数。
+        binding = state.db.create_binding(
             branch,
             data.get("constraint_set", ""),
             set_version,
-            data.get("expected_version_number"),
+            expected,
             data.get("timestamp"),
-            version_id,
-        )}
+        )
+        return {"binding": binding}
     except VersionConflict as exc:
         raise HTTPException(detail=exc.detail, status_code=HTTP_409_CONFLICT) from exc
     except KeyError as exc:
@@ -277,7 +302,8 @@ def create_app(db_path: str | None = None, seed: bool = True) -> Litestar:
             health, workbook, branches, versions, version_detail, version_constraint_set,
             validate, commit, create_branch, merge_preview, merge,
             constraint_sets, constraint_set, create_constraint_set, update_constraint_set,
-            constraint_bindings, constraint_binding_history, create_constraint_binding,
+            constraint_bindings, constraint_binding_history, constraint_pin_history,
+            create_constraint_binding,
             index,
         ],
         static_files_config=[

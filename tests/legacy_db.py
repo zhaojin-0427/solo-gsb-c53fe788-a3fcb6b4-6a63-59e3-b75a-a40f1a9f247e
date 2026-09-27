@@ -153,3 +153,22 @@ def build_legacy_db(path: str = ":memory:") -> sqlite3.Connection:
                 (branch, number, set_id, wb_number, FIXED_TIME),
             )
     return conn
+
+
+def build_tampered_legacy_db(path: str = ":memory:") -> sqlite3.Connection:
+    """构造“历史钉版串改分支门禁”修复前的问题库。
+
+    在 :func:`build_legacy_db` 基础上追加：main 当前绑定代数 2 指向
+    严格规则（规则集 v2，max=10），随后一次版本级钉版在旧实现里被错误
+    追加为 main #3，回指历史 v1 并挂宽松规则（规则集 v1，max 无上限）。
+    旧代码下 active_binding(main) 因此退回宽松 v1，门禁被放行。
+    """
+    conn = build_legacy_db(path)
+    with conn:
+        conn.execute(
+            """INSERT INTO constraint_binding(branch_name,binding_number,constraint_set_id,
+                   workbook_version_number,created_at)
+               VALUES ('main',3,1,1,?)""",
+            (FIXED_TIME,),
+        )
+    return conn

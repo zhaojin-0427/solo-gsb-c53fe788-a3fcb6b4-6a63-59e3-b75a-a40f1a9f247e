@@ -13,6 +13,7 @@ const state = {
   constraintSets: [],
   bindings: [],
   bindingHistory: [],
+  pinHistory: [],
   setDetailCache: {},
   viewedSet: null,
 };
@@ -681,7 +682,8 @@ function renderViewedVersionRules() {
     if (viewed) {
       info.innerHTML = `历史版本 <strong>v${state.versionDetail.version.version_number}</strong> 生效规则：` +
         `<strong>${esc(viewed.constraint_set)}@v${viewed.constraint_set_version}</strong>` +
-        `（${sourceLabel(viewed.source)}）`;
+        `（${sourceLabel(viewed.source)}` +
+        `，钉版修订 ${viewed.pin_revision ?? 0}）`;
       for (const rule of viewed.rules || []) {
         const div = document.createElement('div');
         div.className = 'rule-item';
@@ -720,14 +722,17 @@ async function getSetDetail(name) {
 }
 
 async function loadConstraints() {
-  const [sets, bindings, history] = await Promise.all([
+  const query = encodeURIComponent(state.branch);
+  const [sets, bindings, history, pins] = await Promise.all([
     api('/api/constraint-sets'),
     api('/api/constraint-bindings'),
-    api(`/api/constraint-bindings/history?branch=${encodeURIComponent(state.branch)}`),
+    api(`/api/constraint-bindings/history?branch=${query}`),
+    api(`/api/constraint-bindings/pins?branch=${query}`),
   ]);
   state.constraintSets = sets;
   state.bindings = bindings;
   state.bindingHistory = history;
+  state.pinHistory = pins;
   renderConstraintPanel();
 }
 
@@ -755,18 +760,35 @@ async function renderConstraintPanel() {
 
   const historyBox = $('binding-history');
   historyBox.textContent = '';
-  if (!state.bindingHistory.length) {
-    historyBox.innerHTML = '<p class="muted">当前分支还没有绑定记录。</p>';
-  }
-  for (const item of [...state.bindingHistory].reverse()) {
+  const renderEntry = (item, isPin) => {
     const div = document.createElement('div');
     div.className = 'edge-item';
-    const target = item.workbook_version_id
-      ? `版本 #${item.workbook_version_id}（v${item.workbook_version_number}）`
-      : `工作簿 v${item.workbook_version_number}`;
-    div.textContent = `#${item.binding_number} · ${item.constraint_set}@v${item.constraint_set_version}` +
-      ` · 钉住${target} · ${item.created_at}`;
+    const target = `版本 #${item.workbook_version_id}（v${item.workbook_version_number}）`;
+    const label = isPin ? `钉版修订 #${item.pin_number}` : `绑定代数 #${item.binding_number}`;
+    div.textContent = `${label} · ${item.constraint_set}@v${item.constraint_set_version}` +
+      ` · ${isPin ? '钉到' : '绑定时头'}${target} · ${item.created_at}`;
     historyBox.append(div);
+  };
+  if (!state.bindingHistory.length && !state.pinHistory.length) {
+    historyBox.innerHTML = '<p class="muted">当前分支还没有绑定或钉版记录。</p>';
+  }
+  if (state.bindingHistory.length) {
+    const heading = document.createElement('p');
+    heading.className = 'muted';
+    heading.textContent = `分支换绑（${state.bindingHistory.length}）：决定后续预演/提交/合并门禁`;
+    historyBox.append(heading);
+  }
+  for (const item of [...state.bindingHistory].reverse()) {
+    renderEntry(item, false);
+  }
+  if (state.pinHistory.length) {
+    const heading = document.createElement('p');
+    heading.className = 'muted';
+    heading.textContent = `历史版本钉版（${state.pinHistory.length}）：只改变对应历史版本的规则`;
+    historyBox.append(heading);
+  }
+  for (const item of [...state.pinHistory].reverse()) {
+    renderEntry(item, true);
   }
 }
 
@@ -883,20 +905,17 @@ async function bindConstraintSet() {
       constraint_set: name,
       constraint_set_version: version,
     };
-    let targetBinding;
-    let targetBranch = state.branch;
     if (pinToViewed) {
-      // 版本级钉住：不传 branch，由后端按版本归属分支校验并落记录。
+      // 版本级钉版：不传 branch，由后端按版本归属分支校验并落记录。
+      // 钉版与分支绑定是两类状态：expected_version_number 是目标版本自身
+      // 的钉版修订号（未钉版为 0），不读取、也不前进分支绑定代数。
       payload.version_id = state.versionId;
-      const owner = state.versionDetail.version.branch_name;
-      if (owner !== state.branch) targetBranch = owner;
-      // expected_version_number 是归属分支当前绑定代数。
-      targetBinding = state.bindings.find((b) => b.branch_name === owner) || null;
+      payload.expected_version_number = state.viewedSet?.pin_revision ?? 0;
     } else {
+      // 分支换绑：沿用该分支当前绑定代数。
       payload.branch = state.branch;
-      targetBinding = currentBinding();
+      payload.expected_version_number = currentBinding() ? currentBinding().binding_number : 0;
     }
-    payload.expected_version_number = targetBinding ? targetBinding.binding_number : 0;
     const result = await api('/api/constraint-bindings', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -904,10 +923,12 @@ async function bindConstraintSet() {
     $('constraint-pin-version').checked = false;
     await loadConstraints();
     if (pinToViewed) {
-      // 刷新当前历史版本详情，展示刚钉住的规则。
+      // 刷新当前历史版本详情，展示刚钉住的规则与新的钉版修订号。
       await loadVersion(state.versionId);
+      const owner = state.versionDetail.version.branch_name;
       setStatus(
-        `已把 ${name}@v${version} 钉到 ${targetBranch} 分支的历史版本 v${state.versionDetail.version.version_number}（绑定代数 ${result.binding.binding_number}）`,
+        `已把 ${name}@v${version} 钉到 ${owner} 分支的历史版本 v${state.versionDetail.version.version_number}` +
+        `（钉版修订 ${result.pin.pin_number}，不影响分支门禁）`,
         'ok',
       );
     } else {
